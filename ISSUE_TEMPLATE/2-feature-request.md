@@ -1,5 +1,8 @@
-## 🚀 Feature request
-### Suggest an idea for this project
+---
+name: "\U0001F680 Feature request"
+about: Suggest an idea for this project
+
+---
 
 <!--
 Thank you for suggesting an idea to make Sonr better.

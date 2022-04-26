@@ -1,6 +1,8 @@
+---
+name: "\U0001F41B Bug report"
+about: Create a report to help us improve
 
-# 🐛 Bug report
-## Create a report to help us improve
+---
 
 <!--
 Thank you for reporting a possible bug in Sonr

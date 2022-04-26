@@ -1,0 +1,88 @@
+name: Bug Report
+description: File a bug report
+title: "[Feature \U0001F680]: "
+labels: ["Feature", "triage"]
+assignees:
+  - ntindle
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report!
+  - type: input
+    id: contact
+    attributes:
+      label: Contact Details
+      description: How can we get in touch with you if we need more info?
+      placeholder: ex. email@example.com
+    validations:
+      required: false
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: What is the expected behavior?
+      description: |
+        If you're describing a bug, tell us what should happen
+        If you're suggesting a change/improvement, tell us how it should work
+        placeholder: Tell us what you want!
+        value: "A bug happened!"
+    validations:
+      required: true
+  - type: textarea
+    id: current-behavior
+    attributes:
+      label: What is the current behavior?
+      description: |
+        If describing a bug, tell us what happens instead of the expected behavior
+        If suggesting a change/improvement, explain the difference from current behavior
+        placeholder: What's happening?!
+        value: "Everything is broken"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: |
+        How do you trigger this bug? Please walk us through it step by step.
+        Provide a link to a live example, or an unambiguous set of steps to reproduce this bug. Include code to reproduce, if relevant
+      value: |
+        1.
+        2.
+        3.
+        ...
+      render: bash
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: What version of our software are you running?
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Please copy and paste any relevant log output. This will be automatically formatted into code, so no need for backticks.
+      render: shell
+  - type: textarea
+    id: environment
+    attributes:
+      label: Your Environment
+      description: |
+        Include as many relevant details about the environment you experienced the bug in
+      value: |
+        * Version used:
+        * Environment name and version (e.g. Chrome 39, node.js 5.4):
+        * Operating System and version (desktop or mobile):
+        * Link to your project:
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Code of Conduct
+      description: By submitting this issue, you agree to follow our [Code of Conduct](https://example.com)
+      options:
+        - label: I agree to follow this project's Code of Conduct
+          required: true
