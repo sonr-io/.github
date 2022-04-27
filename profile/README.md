@@ -22,4 +22,4 @@ Links | Repos | Articles
 --|--|--
 [Homepage](https://sonr.io)|[sonr-io/sonr](https://github.com/sonr-io/sonr)|[Getting a Sonr Grant](https://www.sonr.io/blog/sonr-grants)
 [Documentation](https://docs.sonr.io)|[sonr-io/nebula-react](https://github.com/sonr-io/nebula-react)|[Our Grant Process](https://www.sonr.io/blog/grant-process)
-[Social Media](https://sonr.io/links)|[sonr-io/sonr](https://github.com/sonr-io/did-go)|[Sonr's Highway SDK](https://www.sonr.io/build/highway)
+[Social Media](https://sonr.io/links)|[sonr-io/did-go](https://github.com/sonr-io/did-go)|[Sonr's Highway SDK](https://www.sonr.io/build/highway)
