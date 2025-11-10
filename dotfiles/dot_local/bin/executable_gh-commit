@@ -1,0 +1,847 @@
+#!/usr/bin/env bash
+set -e
+
+# Auto-confirm mode: if AUTO_CONFIRM=1, automatically confirm all prompts
+AUTO_CONFIRM="${AUTO_CONFIRM:-0}"
+
+# Mods command with preconfigured settings to prevent accidental MCP server starts
+MODS_CMD="mods --mcp-disable github --mcp-disable context7 -R write-commit"
+
+# Helper function for confirmations that respects AUTO_CONFIRM
+confirm() {
+    if [[ "$AUTO_CONFIRM" == "1" ]]; then
+        return 0
+    fi
+    gum confirm "$@"
+}
+
+# Filter diff content to reduce LLM context overload
+# Removes noise from generated files, lock files, and truncates large diffs
+filter_diff() {
+    local diff_input="$1"
+
+    # Patterns for files to filter (lockfiles, generated, minified, build artifacts)
+    local filter_patterns='(package-lock\\.json|yarn\\.lock|pnpm-lock\\.yaml|bun\\.lockb|go\\.sum|go\\.mod|Cargo\\.lock|poetry\\.lock|composer\\.lock|Gemfile\\.lock|.*\\.min\\.(js|css)|.*\\.bundle\\.js|.*\\.map|dist/.*|build/.*|\\.next/.*|node_modules/.*|vendor/.*|__pycache__/.*|\\.pyc$|target/.*)'
+
+    # Use awk to intelligently process the diff
+    echo "$diff_input" | awk -v patterns="$filter_patterns" '
+    BEGIN {
+        in_filtered_file = 0
+        in_large_json = 0
+        current_file = ""
+        line_count = 0
+        max_lines_per_file = 200
+        json_line_count = 0
+        max_json_lines = 50
+    }
+
+    # Detect file header in diff
+    /^diff --git/ {
+        # Extract filename from "diff --git a/path b/path"
+        match($0, /b\/([^ ]+)/, arr)
+        current_file = arr[1]
+
+        # Check if this is a filtered file type
+        if (match(current_file, patterns)) {
+            in_filtered_file = 1
+            in_large_json = 0
+            print $0
+            next
+        }
+        # Check if this is a JSON file (might be large)
+        else if (match(current_file, /\.json$/)) {
+            in_filtered_file = 0
+            in_large_json = 1
+            json_line_count = 0
+            print $0
+            next
+        }
+        else {
+            in_filtered_file = 0
+            in_large_json = 0
+            line_count = 0
+            print $0
+            next
+        }
+    }
+
+    # Handle filtered files (generated/lock files)
+    in_filtered_file == 1 {
+        # Only keep essential headers
+        if (/^(index|---|\\+\\+\\+|@@)/) {
+            print $0
+            if (/^@@/) {
+                print "[Generated/lock file - content filtered to reduce noise]"
+                in_filtered_file = 2  # Mark as summarized
+            }
+        }
+        next
+    }
+
+    # Handle large JSON files
+    in_large_json == 1 {
+        if (/^(index|---|\\+\\+\\+)/) {
+            print $0
+            next
+        }
+        if (/^@@/) {
+            print $0
+            next
+        }
+
+        # Count lines in JSON diff
+        if (/^[+-]/) {
+            json_line_count++
+            if (json_line_count <= max_json_lines) {
+                print $0
+            } else if (json_line_count == max_json_lines + 1) {
+                print "[... JSON diff truncated after " max_json_lines " lines - file structure preserved ...]"
+            }
+        } else {
+            print $0
+        }
+        next
+    }
+
+    # For normal files, limit total line count per file
+    {
+        if (/^diff --git/) {
+            line_count = 0
+        }
+
+        if (line_count < max_lines_per_file) {
+            print $0
+            line_count++
+        } else if (line_count == max_lines_per_file) {
+            print "[... diff truncated after " max_lines_per_file " lines ...]"
+            line_count++
+        }
+    }
+    '
+}
+
+SCOPES_FILE=".github/Repo.toml"
+
+# Handle --help flag
+if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+    gum style --foreground 212 --bold "smartcommit - AI-powered scoped git commits"
+    echo ""
+    gum style --foreground 75 "Usage:"
+    echo "  smartcommit           # Generate and commit changes by scope"
+    echo "  smartcommit --init    # Generate .github/Repo.toml using Claude"
+    echo "  smartcommit --refresh # Update existing Repo.toml based on current repo structure"
+    echo "  smartcommit --sync    # Sync scopes to GitHub labels (requires gh CLI)"
+    echo "  smartcommit --help    # Show this help message"
+    echo ""
+    gum style --foreground 75 "Environment variables:"
+    echo "  AUTO_CONFIRM=1        # Skip all confirmation prompts"
+    echo ""
+    gum style --foreground 75 "Examples:"
+    echo "  smartcommit                    # Interactive commit workflow"
+    echo "  AUTO_CONFIRM=1 smartcommit     # Auto-confirm all commits"
+    echo "  smartcommit --init             # Generate scopes for new repository"
+    echo "  smartcommit --refresh          # Update scopes after structural changes"
+    echo "  smartcommit --sync             # Create/update GitHub labels for all scopes"
+    exit 0
+fi
+
+# Handle --init flag to generate Repo.toml
+if [[ "$1" == "--init" ]]; then
+    # Check if we're in a git repository
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        gum style --foreground 9 "Not in a git repository"
+        exit 1
+    fi
+
+    # Check for existing scopes.json and offer migration
+    OLD_SCOPES_FILE=".github/scopes.json"
+    if [[ -f "$OLD_SCOPES_FILE" ]]; then
+        gum style --foreground 212 --bold "Found existing scopes.json - Migration available"
+        echo ""
+        gum style --foreground 75 "Old format: JSON array with single path per scope"
+        gum style --foreground 75 "New format: TOML with multiple paths per scope"
+        echo ""
+
+        if confirm "Migrate scopes.json to Repo.toml?"; then
+            echo ""
+            gum style --foreground 75 "Migrating scopes.json to Repo.toml format..."
+
+            # Read and convert scopes.json to Repo.toml, grouping paths by scope
+            echo "[scopes]" > "$SCOPES_FILE"
+            jq -r 'group_by(.scope) | .[] | "\(.[0].scope) = [\(map(.path) | map("\"" + . + "\"") | join(", "))]"' "$OLD_SCOPES_FILE" >> "$SCOPES_FILE"
+
+            # Validate the generated TOML
+            if cat "$SCOPES_FILE" | dasel query -i toml -o json --root >/dev/null 2>&1; then
+                gum style --foreground 2 "✓ Successfully migrated to $SCOPES_FILE"
+                echo ""
+                gum style --foreground 212 "Migrated scopes:"
+                cat "$SCOPES_FILE" | dasel query -i toml -o json --root | jq -r '.scopes | to_entries[] | "  • \(.key): \(.value | join(", "))"' | gum style --foreground 75
+                echo ""
+
+                # Offer to backup old file
+                if confirm "Backup old scopes.json?"; then
+                    backup_file="$OLD_SCOPES_FILE.backup.$(date +%Y%m%d_%H%M%S)"
+                    mv "$OLD_SCOPES_FILE" "$backup_file"
+                    gum style --foreground 246 "Backed up to: $backup_file"
+                else
+                    rm "$OLD_SCOPES_FILE"
+                    gum style --foreground 246 "Removed old scopes.json"
+                fi
+
+                echo ""
+                gum style --foreground 240 "You can now run 'smartcommit' to use the migrated scopes"
+                exit 0
+            else
+                gum style --foreground 9 "Error: Migration produced invalid TOML"
+                rm "$SCOPES_FILE"
+                exit 1
+            fi
+        fi
+    fi
+
+    # Check if Repo.toml already exists
+    if [[ -f "$SCOPES_FILE" ]]; then
+        gum style --foreground 214 "⚠ $SCOPES_FILE already exists"
+        if ! confirm "Overwrite existing Repo.toml?"; then
+            gum style --foreground 240 "Cancelled"
+            exit 0
+        fi
+    fi
+
+    # Check if claude command exists
+    if ! command -v claude >/dev/null 2>&1; then
+        gum style --foreground 9 "Error: 'claude' command not found. Please install Claude Code first:"
+        gum style --foreground 75 "  npm install -g @anthropic-ai/claude-code"
+        exit 1
+    fi
+
+    # Ensure .github directory exists
+    mkdir -p .github
+
+    gum style --foreground 212 --bold "Generating Repo.toml for repository..."
+    echo ""
+
+    # Generate Repo.toml using Claude
+    PROMPT="Analyze this git repository and generate a .github/Repo.toml file for the smartcommit tool.
+
+The Repo.toml file should:
+1. Have a [scopes] section
+2. Map logical project areas to arrays of directory paths
+3. Each scope can have MULTIPLE paths (unlike the old single-path format)
+4. Use scope names that work well in conventional commits (e.g., 'docs', 'tests', 'config', 'ci', 'scripts')
+5. Cover the main directories in the repository
+6. Group related paths under the same scope when appropriate
+
+Example format:
+[scopes]
+ci = [\".github/workflows\"]
+config = [\".github\", \".config\", \"package.json\"]
+docs = [\"docs\", \"README.md\"]
+tests = [\"tests\", \"__tests__\"]
+scripts = [\"scripts\", \"bin\"]
+core = [\"src\"]
+
+Please analyze the repository structure and output ONLY the TOML content (no markdown, no explanation, just the raw TOML)."
+
+    # Create temp files for Claude input and output
+    claude_input=$(mktemp)
+    claude_output=$(mktemp)
+    trap "rm -f $claude_input $claude_output" EXIT
+
+    # Write prompt to input file
+    echo "$PROMPT" > "$claude_input"
+
+    # Run claude with spinner and capture output
+    if ! gum spin --spinner dot --title "Analyzing repository structure with Claude..." -- \
+        sh -c "claude -p < '$claude_input' > '$claude_output' 2>&1"; then
+        gum style --foreground 9 "Error: Failed to generate Repo.toml with Claude"
+        cat "$claude_output" | gum style --foreground 240
+        exit 1
+    fi
+
+    output=$(cat "$claude_output")
+
+    # Extract TOML from output (in case Claude wraps it in markdown)
+    toml_output=$(echo "$output" | awk '/^\[scopes\]/{flag=1} flag' | sed '/^```/d')
+
+    # Save TOML to temp file for validation
+    temp_toml=$(mktemp)
+    echo "$toml_output" > "$temp_toml"
+
+    # Validate TOML
+    if ! cat "$temp_toml" | dasel query -i toml -o json --root >/dev/null 2>&1; then
+        gum style --foreground 9 "Error: Generated output is not valid TOML"
+        gum style --foreground 240 "Output received:"
+        echo "$output" | gum style --foreground 246
+        rm "$temp_toml"
+        exit 1
+    fi
+
+    # Save TOML
+    mv "$temp_toml" "$SCOPES_FILE"
+
+    gum style --foreground 2 "✓ Successfully generated $SCOPES_FILE"
+    echo ""
+    gum style --foreground 212 "Generated scopes:"
+    cat "$SCOPES_FILE" | dasel query -i toml -o json --root | jq -r '.scopes | to_entries[] | "  • \(.key): \(.value | join(", "))"' | gum style --foreground 75
+    echo ""
+    gum style --foreground 240 "You can now run 'smartcommit' to use these scopes for commits"
+    exit 0
+fi
+
+# Handle --refresh flag to update existing scopes.json
+if [[ "$1" == "--refresh" ]]; then
+    # Check if we're in a git repository
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        gum style --foreground 9 "Not in a git repository"
+        exit 1
+    fi
+
+    # Check if Repo.toml exists
+    if [[ ! -f "$SCOPES_FILE" ]]; then
+        gum style --foreground 9 "Error: $SCOPES_FILE does not exist"
+        echo ""
+        gum style --foreground 75 "Run 'smartcommit --init' to create it first"
+        exit 1
+    fi
+
+    # Check if claude command exists
+    if ! command -v claude >/dev/null 2>&1; then
+        gum style --foreground 9 "Error: 'claude' command not found. Please install Claude Code first:"
+        gum style --foreground 75 "  npm install -g @anthropic-ai/claude-code"
+        exit 1
+    fi
+
+    gum style --foreground 212 --bold "Refreshing Repo.toml based on current repository structure..."
+    echo ""
+
+    # Read existing Repo.toml
+    existing_scopes=$(cat "$SCOPES_FILE")
+
+    # Validate existing TOML
+    if ! cat "$SCOPES_FILE" | dasel query -i toml -o json --root >/dev/null 2>&1; then
+        gum style --foreground 9 "Error: Existing $SCOPES_FILE is not valid TOML"
+        exit 1
+    fi
+
+    # Show current scopes
+    gum style --foreground 75 "Current scopes:"
+    cat "$SCOPES_FILE" | dasel query -i toml -o json --root | jq -r '.scopes | to_entries[] | "  • \(.key): \(.value | join(", "))"' | gum style --foreground 246
+    echo ""
+
+    if ! confirm "Refresh scopes based on current repository structure?"; then
+        gum style --foreground 240 "Cancelled"
+        exit 0
+    fi
+
+    echo ""
+
+    # Generate refresh prompt for Claude
+    PROMPT="Analyze this git repository and UPDATE the existing .github/Repo.toml file.
+
+Current Repo.toml content:
+$existing_scopes
+
+Your task:
+1. Review the current scopes and their paths
+2. Analyze the current repository directory structure
+3. Update the scopes to reflect any new directories or structural changes
+4. Keep existing scopes that are still relevant
+5. Remove scopes for paths that no longer exist
+6. Add new scopes for new directories or logical areas
+7. Maintain the same format: TOML with [scopes] section mapping scope names to arrays of paths
+8. Each scope can have multiple paths
+9. Use conventional commit-friendly scope names
+
+Output ONLY the updated TOML content (no markdown, no explanation, just the raw TOML)."
+
+    # Create temp files for Claude input and output
+    claude_input=$(mktemp)
+    claude_output=$(mktemp)
+    trap "rm -f $claude_input $claude_output" EXIT
+
+    # Write prompt to input file
+    echo "$PROMPT" > "$claude_input"
+
+    # Run claude with spinner and capture output
+    if ! gum spin --spinner dot --title "Analyzing repository and updating scopes with Claude..." -- \
+        sh -c "claude -p < '$claude_input' > '$claude_output' 2>&1"; then
+        gum style --foreground 9 "Error: Failed to refresh Repo.toml with Claude"
+        cat "$claude_output" | gum style --foreground 240
+        exit 1
+    fi
+
+    output=$(cat "$claude_output")
+
+    # Extract TOML from output (in case Claude wraps it in markdown)
+    toml_output=$(echo "$output" | awk '/^\[scopes\]/{flag=1} flag' | sed '/^```/d')
+
+    # Save TOML to temp file for validation
+    temp_toml=$(mktemp)
+    echo "$toml_output" > "$temp_toml"
+
+    # Validate TOML
+    if ! cat "$temp_toml" | dasel query -i toml -o json --root >/dev/null 2>&1; then
+        gum style --foreground 9 "Error: Generated output is not valid TOML"
+        gum style --foreground 240 "Output received:"
+        echo "$output" | gum style --foreground 246
+        rm "$temp_toml"
+        exit 1
+    fi
+
+    # Show updated scopes
+    echo ""
+    gum style --foreground 2 "✓ Successfully generated updated scopes"
+    echo ""
+    gum style --foreground 212 "Updated scopes:"
+    cat "$temp_toml" | dasel query -i toml -o json --root | jq -r '.scopes | to_entries[] | "  • \(.key): \(.value | join(", "))"' | gum style --foreground 75
+    echo ""
+
+    # Create backup of existing file
+    backup_file="$SCOPES_FILE.backup.$(date +%Y%m%d_%H%M%S)"
+    cp "$SCOPES_FILE" "$backup_file"
+    gum style --foreground 246 "Backup saved to: $backup_file"
+    echo ""
+
+    if confirm "Apply these changes to $SCOPES_FILE?"; then
+        # Save TOML
+        mv "$temp_toml" "$SCOPES_FILE"
+        gum style --foreground 2 "✓ Successfully updated $SCOPES_FILE"
+        echo ""
+        gum style --foreground 240 "You can now run 'smartcommit' to use the updated scopes"
+    else
+        gum style --foreground 240 "Changes not applied - backup available at $backup_file"
+        rm "$backup_file" "$temp_toml"
+    fi
+
+    exit 0
+fi
+
+# Handle --sync flag to create GitHub labels for scopes
+if [[ "$1" == "--sync" ]]; then
+    # Check if we're in a git repository
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        gum style --foreground 9 "Not in a git repository"
+        exit 1
+    fi
+
+    # Check if Repo.toml exists
+    if [[ ! -f "$SCOPES_FILE" ]]; then
+        gum style --foreground 9 "Error: $SCOPES_FILE does not exist"
+        echo ""
+        gum style --foreground 75 "Run 'smartcommit --init' to create it first"
+        exit 1
+    fi
+
+    # Check if gh command exists
+    if ! command -v gh >/dev/null 2>&1; then
+        gum style --foreground 9 "Error: 'gh' command not found. Please install GitHub CLI first:"
+        gum style --foreground 75 "  https://cli.github.com/"
+        exit 1
+    fi
+
+    # Check if we're in a GitHub repository
+    if ! gh repo view >/dev/null 2>&1; then
+        gum style --foreground 9 "Error: Not a GitHub repository or not authenticated with gh"
+        gum style --foreground 75 "Run 'gh auth login' to authenticate"
+        exit 1
+    fi
+
+    gum style --foreground 212 --bold "Syncing scopes to GitHub labels..."
+    echo ""
+
+    # Convert TOML to JSON
+    SCOPES_JSON_FILE=$(mktemp)
+    trap "rm -f $SCOPES_JSON_FILE" EXIT
+
+    if ! cat "$SCOPES_FILE" | dasel query -i toml -o json --root > "$SCOPES_JSON_FILE"; then
+        gum style --foreground 9 "Error: Failed to convert Repo.toml to JSON"
+        exit 1
+    fi
+
+    # Validate the JSON has scopes
+    if ! jq -e '.scopes' < "$SCOPES_JSON_FILE" >/dev/null 2>&1; then
+        gum style --foreground 9 "Error: Repo.toml does not contain a [scopes] section"
+        exit 1
+    fi
+
+    # Function to generate a consistent color from a string
+    generate_color() {
+        local scope=$1
+        # Use md5sum to hash the scope name and extract first 6 chars as hex color
+        # Different scopes will get different colors
+        echo -n "$scope" | md5sum | cut -c1-6
+    }
+
+    # Get all scopes and create labels
+    # Read all scopes into array first to avoid subshell issues
+    mapfile -t scopes < <(jq -r '.scopes | keys[]' < "$SCOPES_JSON_FILE")
+
+    total_scopes=${#scopes[@]}
+
+    if [[ $total_scopes -eq 0 ]]; then
+        gum style --foreground 9 "Error: No scopes found in Repo.toml"
+        exit 1
+    fi
+
+    gum style --foreground 75 "Found $total_scopes scope(s). Creating labels..."
+    echo ""
+
+    created=0
+    updated=0
+    failed=0
+    processed=0
+
+    # Temporarily disable exit on error for label operations
+    set +e
+
+    for scope in "${scopes[@]}"; do
+        [[ -z "$scope" ]] && continue
+
+        ((processed++))
+
+        # Use scope name directly (no prefix)
+        label_name="$scope"
+
+        # Get paths for this scope
+        paths=$(jq -r --arg s "$scope" '.scopes[$s] | join(", ")' < "$SCOPES_JSON_FILE")
+
+        # Generate description
+        description="Changes to: $paths"
+
+        # Generate color (use scope name for consistency)
+        color=$(generate_color "$scope")
+
+        # Try to create label (or update if exists)
+        create_output=$(gh label create "$label_name" --description "$description" --color "$color" 2>&1)
+        create_status=$?
+
+        if [[ $create_status -eq 0 ]]; then
+            gum style --foreground 2 "  ✓ Created label: $label_name ($processed/$total_scopes)"
+            ((created++))
+        else
+            # Label might already exist, try to edit it
+            edit_output=$(gh label edit "$label_name" --description "$description" --color "$color" 2>&1)
+            edit_status=$?
+
+            if [[ $edit_status -eq 0 ]]; then
+                gum style --foreground 214 "  ↻ Updated label: $label_name ($processed/$total_scopes)"
+                ((updated++))
+            else
+                gum style --foreground 9 "  ✗ Failed to create/update label: $label_name ($processed/$total_scopes)"
+                gum style --foreground 240 "    Error: $edit_output"
+                ((failed++))
+            fi
+        fi
+    done
+
+    # Re-enable exit on error
+    set -e
+
+    echo ""
+    gum style --foreground 2 --bold "Sync complete!"
+    gum style --foreground 75 "Created: $created | Updated: $updated | Failed: $failed"
+
+    if [[ $failed -gt 0 ]]; then
+        echo ""
+        gum style --foreground 240 "Note: Some labels may have failed due to permissions or naming conflicts"
+    fi
+
+    exit 0
+fi
+
+# Check if scopes file exists
+if [[ ! -f "$SCOPES_FILE" ]]; then
+    echo ""
+    gum style --foreground 214 --bold "⚠ No Repo.toml found"
+    echo ""
+    gum style --foreground 75 "smartcommit requires a Repo.toml file to organize commits by project areas."
+    echo ""
+    gum style --foreground 246 "The Repo.toml file maps directories to logical commit scopes:"
+    echo ""
+    gum style --foreground 246 "  Example: config = [\".config\", \"package.json\"], docs = [\"docs\"]"
+    echo ""
+
+    if confirm "Would you like to generate Repo.toml now using Claude?"; then
+        echo ""
+        exec "$0" --init
+    else
+        echo ""
+        gum style --foreground 240 "You can generate Repo.toml later by running:"
+        gum style --foreground 75 "  smartcommit --init"
+        echo ""
+        exit 1
+    fi
+fi
+
+# Get all changed files (staged, unstaged, and untracked) and find their scopes
+gum style --foreground 212 "Finding scopes with changes..."
+
+# Combine staged, unstaged, and untracked files
+CHANGED_FILES=$( (git diff --cached --name-only; git diff --name-only; git ls-files --others --exclude-standard) | sort -u)
+
+# Convert TOML to JSON using dasel and write to temp file
+SCOPES_JSON_FILE=$(mktemp)
+trap "rm -f $SCOPES_JSON_FILE" EXIT
+
+if ! cat "$SCOPES_FILE" | dasel query -i toml -o json --root > "$SCOPES_JSON_FILE"; then
+    gum style --foreground 9 "Error: Failed to convert Repo.toml to JSON"
+    exit 1
+fi
+
+# Validate the JSON has scopes
+if ! jq -e '.scopes' < "$SCOPES_JSON_FILE" >/dev/null 2>&1; then
+    gum style --foreground 9 "Error: Repo.toml does not contain a [scopes] section"
+    gum style --foreground 240 "Content of $SCOPES_FILE:"
+    cat "$SCOPES_FILE" | head -20 | gum style --foreground 246
+    exit 1
+fi
+
+# Find which scopes have changes
+# We use a temp file to avoid subshell issues with while loops in pipes
+SCOPES_TEMP=$(mktemp)
+trap "rm -f $SCOPES_JSON_FILE $SCOPES_TEMP" EXIT
+
+# Get all scope names
+while read -r scope; do
+    [[ -z "$scope" ]] && continue
+
+    # Get all paths for this scope into an array
+    mapfile -t paths < <(jq -r --arg s "$scope" '.scopes[$s][]' < "$SCOPES_JSON_FILE")
+
+    # Check if any changed file matches any path in this scope
+    found=0
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        for path in "${paths[@]}"; do
+            [[ -z "$path" ]] && continue
+            if [[ "$file" == "$path"* ]]; then
+                echo "$scope" >> "$SCOPES_TEMP"
+                found=1
+                break
+            fi
+        done
+        [[ $found -eq 1 ]] && break
+    done <<< "$CHANGED_FILES"
+done < <(jq -r '.scopes | keys[]' < "$SCOPES_JSON_FILE")
+
+# Read unique scopes from temp file
+SCOPES=$(sort -u "$SCOPES_TEMP" | tr '\n' ' ')
+
+if [[ -z "$SCOPES" ]]; then
+    gum style --foreground 240 "No scoped changes found"
+else
+    gum style --foreground 75 "Scopes with changes: $(echo $SCOPES | tr '\n' ' ')"
+    echo ""
+fi
+
+# Process each scope
+for scope in $SCOPES; do
+    gum style --foreground 212 --bold "Processing scope: $scope"
+
+    # Get all paths for this scope from the JSON file
+    scope_paths=$(jq -r --arg s "$scope" '.scopes[$s][]' < "$SCOPES_JSON_FILE")
+
+    if [[ -z "$scope_paths" ]]; then
+        gum style --foreground 214 "⚠ Warning: Could not find paths for scope $scope"
+        continue
+    fi
+
+    # Reset staging area
+    git reset HEAD -- . 2>/dev/null || true
+
+    # Display the paths for this scope
+    gum style --foreground 75 "  Paths: $(echo "$scope_paths" | tr '\n' ', ' | sed 's/,$//')"
+
+    # Get all changed files in any of this scope's paths
+    scope_files=""
+    while read path; do
+        [[ -z "$path" ]] && continue
+        # Use git status to catch all modified, added, deleted, and untracked files
+        files=$(git status --porcelain | awk '{print $NF}' | grep "^$path" || true)
+        if [[ -n "$files" ]]; then
+            scope_files="$scope_files"$'\n'"$files"
+        fi
+    done <<< "$scope_paths"
+
+    # Remove leading newline and duplicates
+    scope_files=$(echo "$scope_files" | grep -v '^$' | sort -u)
+
+    if [[ -z "$scope_files" ]]; then
+        gum style --foreground 240 "  No files found in scope paths"
+        continue
+    fi
+
+    gum style --foreground 245 "  Files to stage:"
+    echo "$scope_files" | gum style --foreground 246 | sed 's/^/    /'
+
+    # Stage all files in this scope
+    echo "$scope_files" | xargs -r git add 2>/dev/null || true
+
+    # Get the diff for this scope
+    diff=$(git diff --cached)
+
+    if [[ -z "$diff" ]]; then
+        gum style --foreground 240 "  No changes to commit for $scope"
+        continue
+    fi
+
+    # Generate commit message using mods
+    gum spin --spinner dot --title "Generating commit message..." -- sleep 0.1
+
+    # Filter diff to reduce LLM context overload
+    filtered_diff=$(filter_diff "$diff")
+
+    context="### Git Diff
+$filtered_diff
+
+### Scope
+$scope"
+
+    message=$(echo "$context" | $MODS_CMD)
+
+    gum style --border normal --margin "1" --padding "0 1" --border-foreground 212 "$message"
+
+    # Confirm and commit
+    if confirm "Commit changes for $scope?"; then
+        git commit -m "$message"
+        gum style --foreground 2 "✓ Committed changes for $scope"
+    else
+        gum style --foreground 240 "  Skipped $scope"
+    fi
+
+    echo ""
+done
+
+# Reset staging area at the end
+git reset HEAD -- . 2>/dev/null || true
+
+# Process remaining files in order:
+# 1. Tracked + Staged (already handled above in scopes)
+# 2. Untracked + Staged
+# 3. Tracked + Unstaged
+# 4. Untracked + Unstaged
+
+# Check for any remaining files (staged or unstaged, tracked or untracked)
+REMAINING_FILES=$(git status --porcelain)
+
+if [[ -n "$REMAINING_FILES" ]]; then
+    echo ""
+    gum style --foreground 214 "Processing remaining files that don't match any scope..."
+
+    # First, handle any already staged files (Untracked + Staged)
+    STAGED_FILES=$(git diff --cached --name-only)
+    if [[ -n "$STAGED_FILES" ]]; then
+        echo ""
+        gum style --foreground 212 "Found staged files:"
+        echo "$STAGED_FILES" | gum style --foreground 246 | sed 's/^/  /'
+
+        if confirm "Commit staged files?"; then
+            diff=$(git diff --cached)
+            gum spin --spinner dot --title "Generating commit message..." -- sleep 0.1
+
+            # Filter diff to reduce LLM context overload
+            filtered_diff=$(filter_diff "$diff")
+            message=$(echo "$filtered_diff" | $MODS_CMD)
+
+            gum style --border normal --margin "1" --padding "0 1" --border-foreground 212 "$message"
+
+            git commit -m "$message"
+            gum style --foreground 2 "✓ Committed staged files"
+        fi
+    fi
+
+    # Then, handle tracked unstaged files (Tracked + Unstaged)
+    TRACKED_UNSTAGED=$(git diff --name-only)
+    if [[ -n "$TRACKED_UNSTAGED" ]]; then
+        echo ""
+        gum style --foreground 212 "Found tracked unstaged files:"
+        echo "$TRACKED_UNSTAGED" | gum style --foreground 246 | sed 's/^/  /'
+
+        if confirm "Commit tracked unstaged files?"; then
+            echo "$TRACKED_UNSTAGED" | xargs git add
+            diff=$(git diff --cached)
+
+            gum spin --spinner dot --title "Generating commit message..." -- sleep 0.1
+
+            # Filter diff to reduce LLM context overload
+            filtered_diff=$(filter_diff "$diff")
+            message=$(echo "$filtered_diff" | $MODS_CMD)
+
+            gum style --border normal --margin "1" --padding "0 1" --border-foreground 212 "$message"
+
+            git commit -m "$message"
+            gum style --foreground 2 "✓ Committed tracked unstaged files"
+        fi
+    fi
+
+    # Finally, handle untracked unstaged files (Untracked + Unstaged)
+    UNTRACKED_FILES=$(git ls-files --others --exclude-standard)
+    if [[ -n "$UNTRACKED_FILES" ]]; then
+        echo ""
+        gum style --foreground 212 "Found untracked files:"
+        echo "$UNTRACKED_FILES" | gum style --foreground 246 | sed 's/^/  /'
+
+        if confirm "Commit untracked files?"; then
+            echo "$UNTRACKED_FILES" | xargs git add
+            diff=$(git diff --cached)
+
+            gum spin --spinner dot --title "Generating commit message..." -- sleep 0.1
+
+            # Filter diff to reduce LLM context overload
+            filtered_diff=$(filter_diff "$diff")
+            message=$(echo "$filtered_diff" | $MODS_CMD)
+
+            gum style --border normal --margin "1" --padding "0 1" --border-foreground 212 "$message"
+
+            git commit -m "$message"
+            gum style --foreground 2 "✓ Committed untracked files"
+        fi
+    fi
+
+    # Final check
+    FINAL_STATUS=$(git status --porcelain)
+    if [[ -n "$FINAL_STATUS" ]]; then
+        echo ""
+        gum style --foreground 214 "⚠ Warning: Repository still has uncommitted changes:"
+        echo "$FINAL_STATUS" | gum style --foreground 246 | sed 's/^/  /'
+    fi
+fi
+
+echo ""
+
+# Check for unpushed commits
+UNPUSHED_COMMITS=$(git log --branches --not --remotes --oneline 2>/dev/null)
+
+if [[ -n "$UNPUSHED_COMMITS" ]]; then
+    echo ""
+    gum style --foreground 212 --bold "Unpushed Commits"
+
+    # Use gum format to display the commits nicely
+    COMMIT_COUNT=$(echo "$UNPUSHED_COMMITS" | wc -l)
+    gum style --foreground 75 "Found $COMMIT_COUNT commit(s) ready to push:"
+    echo ""
+
+    # Format each commit with gum
+    while IFS= read -r commit; do
+        HASH=$(echo "$commit" | awk '{print $1}')
+        MESSAGE=$(echo "$commit" | cut -d' ' -f2-)
+        gum format -- "- **$HASH** $MESSAGE"
+    done <<< "$UNPUSHED_COMMITS"
+
+    echo ""
+
+    # Ask if user wants to push
+    if confirm "Push commits to origin?"; then
+        CURRENT_BRANCH=$(git branch --show-current)
+        gum spin --spinner dot --title "Pushing to origin/$CURRENT_BRANCH..." -- git push origin "$CURRENT_BRANCH"
+        gum style --foreground 2 "✓ Successfully pushed to origin/$CURRENT_BRANCH"
+    else
+        gum style --foreground 240 "Skipped push to origin"
+    fi
+else
+    gum style --foreground 240 "No unpushed commits"
+fi
+
+echo ""
+gum style --foreground 2 --bold "✓ Done!"

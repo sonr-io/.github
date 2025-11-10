@@ -1,0 +1,21 @@
+# Claude Code plugin files (not deployed to home)
+.claude
+.claude-plugin
+CLAUDE.md
+
+# GitHub configuration and workflows
+.github
+actions
+
+# Repository infrastructure (not deployed to home)
+tests
+docs
+templates
+profile
+
+# Build and orchestration files
+Dockerfile
+
+# CI/CD and version control
+.gitignore
+.gitattributes
