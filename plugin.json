@@ -1,0 +1,23 @@
+{
+  "name": "",
+  "version": "",
+  "description": "",
+  "packages": [],
+  "env": {
+    "<key>": "<value>"
+  },
+  "create_files": {
+    "<destination>": "<source>"
+  },
+  "shell": {
+    "init_hook": [
+      "<bash commands>"
+    ],
+    "scripts": {
+      "<key>": "<value>"
+    }
+  },
+  "include": [
+    "<path_to_plugin>"
+  ]
+}
